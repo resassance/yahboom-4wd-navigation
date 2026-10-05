@@ -3,6 +3,8 @@ __pycache__/
 .venv/
 venv/
 logs.txt
+logs/
+robot_config.local.json
 *.log
 .env
 .env.*
