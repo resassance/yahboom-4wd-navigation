@@ -8,3 +8,5 @@ robot_config.local.json
 *.log
 .env
 .env.*
+
+/tests/

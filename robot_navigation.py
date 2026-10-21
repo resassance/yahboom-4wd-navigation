@@ -10,7 +10,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from navigation import Config, Navigator, filtered_distance
+from navigation import Config, Navigator, filtered_distance, navigation_plan, scan_angles
 
 
 PINS = {
@@ -69,6 +69,8 @@ class Hardware:
         self.position = None
         self.last_trigger = 0.0
         self.moving = False
+        self.cruising_since = None
+        self.measurement_attempt = 1
 
     def initialize(self):
         import RPi.GPIO as GPIO
@@ -116,25 +118,32 @@ class Hardware:
             except Exception as exc:
                 errors.append(str(exc))
         self.moving = False
+        started = self.cruising_since
+        self.cruising_since = None
         self.emit("brake", reason=reason, errors=errors)
+        if started is not None:
+            self.emit("motor_stop", kind="forward", continuous=True, duration_actual_seconds=round(time.monotonic() - started, 6), reason=reason)
         if errors:
             raise RuntimeError("Motor brake failed: " + "; ".join(errors))
 
-    def pulse(self, kind, seconds, speed, direction, angle=None):
+    def pulse(self, kind, seconds, speed, direction, angle=None, right_speed=None):
+        right_speed = speed if right_speed is None else right_speed
+        if not 0 < speed <= 100 or not 0 < right_speed <= 100 or seconds <= 0:
+            raise ValueError("Invalid motor pulse")
         if self.stop.is_set():
             raise InterruptedError("Stop requested")
         if self.position != 90:
             raise RuntimeError("Sensor must be centred before moving")
         if self.ir_blocked():
             raise InterruptedError("IR obstacle before movement")
-        self.emit("motor_start", kind=kind, duration_requested_seconds=seconds, pwm_left=speed, pwm_right=speed, angle_requested_deg=angle)
+        self.emit("motor_start", kind=kind, duration_requested_seconds=seconds, pwm_left=speed, pwm_right=right_speed, angle_requested_deg=angle)
         started = time.monotonic()
         try:
             self.moving = True
             for name, value in zip(("IN1", "IN2", "IN3", "IN4"), direction):
                 self.gpio.output(PINS[name], value)
             self.left.ChangeDutyCycle(speed)
-            self.right.ChangeDutyCycle(speed)
+            self.right.ChangeDutyCycle(right_speed)
             deadline = started + seconds
             while time.monotonic() < deadline:
                 self.wait(min(0.02, deadline - time.monotonic()))
@@ -147,7 +156,58 @@ class Hardware:
         self.wait(0.1)
 
     def forward(self, seconds):
-        self.pulse("forward", seconds, self.config.move_speed, (1, 0, 1, 0))
+        self.pulse("forward", seconds, self.config.move_speed + self.config.left_drive_trim_pwm, (1, 0, 1, 0), right_speed=self.config.move_speed + self.config.right_drive_trim_pwm)
+
+    def advance(self, seconds):
+        try:
+            if self.stop.is_set():
+                raise InterruptedError("Stop requested")
+            if self.position != 90:
+                raise RuntimeError("Sensor must be centred before moving")
+            if not 0 < seconds <= 0.5:
+                raise ValueError("Invalid forward monitoring interval")
+            if self.ir_blocked():
+                raise InterruptedError("IR obstacle before movement")
+            if self.cruising_since is None:
+                if self.moving:
+                    raise RuntimeError("Another motor command is active")
+                left = self.config.move_speed + self.config.left_drive_trim_pwm
+                right = self.config.move_speed + self.config.right_drive_trim_pwm
+                if not 0 < left <= 100 or not 0 < right <= 100:
+                    raise ValueError("Invalid forward PWM")
+                self.emit("motor_start", kind="forward", continuous=True, pwm_left=left, pwm_right=right, monitoring_interval_seconds=seconds)
+                self.cruising_since = time.monotonic()
+                self.moving = True
+                for name, value in zip(("IN1", "IN2", "IN3", "IN4"), (1, 0, 1, 0)):
+                    self.gpio.output(PINS[name], value)
+                self.left.ChangeDutyCycle(left)
+                self.right.ChangeDutyCycle(right)
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                self.wait(min(0.02, deadline - time.monotonic()))
+                if self.use_ir and self.ir_blocked():
+                    raise InterruptedError("IR obstacle during movement")
+        except BaseException:
+            self.brake("forward_interrupted")
+            raise
+
+    def front_distance(self):
+        if not self.moving:
+            return self.measure(90)
+        try:
+            if self.stop.is_set():
+                raise InterruptedError("Stop requested")
+            if self.position != 90 or self.cruising_since is None:
+                raise RuntimeError("Front monitoring requires centred sensor and forward motion")
+            self.measurement_attempt = 1
+            value = self.raw_distance(1)
+            if value is None or value <= self.config.forward_threshold():
+                self.brake("invalid_front_measurement" if value is None else "front_obstacle")
+            self.emit("front_monitor", distance_cm=value, threshold_cm=self.config.forward_threshold(), motors_active=self.moving, reason="invalid_measurement" if value is None else "obstacle" if value <= self.config.forward_threshold() else "clear")
+            return value
+        except BaseException:
+            self.brake("front_monitor_interrupted")
+            raise
 
     def turn(self, angle):
         rate = self.config.turn_right_deg_per_sec if angle > 0 else self.config.turn_left_deg_per_sec
@@ -157,10 +217,14 @@ class Hardware:
     def point(self, angle):
         if self.moving:
             raise RuntimeError("Cannot move sensor while motors are active")
-        if not 0 <= angle <= 180:
-            raise ValueError("Servo angle outside 0..180")
+        if not self.config.servo_min_deg <= angle <= self.config.servo_max_deg:
+            self.emit("servo_rejected", angle_deg=angle, limits_deg=[self.config.servo_min_deg, self.config.servo_max_deg])
+            raise ValueError("Servo angle outside configured mechanical limits")
         target = int(round(angle))
         self.emit("servo_start", previous_deg=self.position, target_deg=target)
+        if self.position is not None and not self.config.servo_min_deg <= self.position <= self.config.servo_max_deg:
+            self.emit("servo_position_reset", previous_deg=self.position)
+            self.position = None
         if self.position is None:
             self.servo.ChangeDutyCycle(2.5 + 10 * target / 180)
             self.position = target
@@ -213,7 +277,7 @@ class Hardware:
                     if not 0 < value <= self.config.max_distance_cm:
                         value = None
                         reason = "outside_range"
-        self.emit("distance_raw", sample=sample, angle_deg=self.position, distance_cm=value, reason=reason, echo_pulse_seconds=pulse_seconds)
+        self.emit("distance_raw", sample=sample, attempt=self.measurement_attempt, angle_deg=self.position, distance_cm=value, reason=reason, echo_pulse_seconds=pulse_seconds)
         return value
 
     def measure(self, angle=90):
@@ -221,13 +285,24 @@ class Hardware:
             raise RuntimeError("Cannot measure while motors are active")
         if self.position != angle:
             self.point(angle)
-        samples = [self.raw_distance(index + 1) for index in range(self.config.samples)]
-        value = filtered_distance(samples, self.config)
-        self.emit("distance_filtered", angle_deg=angle, distance_cm=value, samples_cm=samples, valid_count=sum(x is not None for x in samples), reason="ok" if value is not None else "insufficient_valid_samples")
-        self.ir_blocked()
-        return value
+        for attempt in range(self.config.measurement_retries + 1):
+            self.measurement_attempt = attempt + 1
+            self.emit("measurement_attempt", angle_deg=angle, attempt=attempt + 1)
+            samples = [self.raw_distance(index + 1) for index in range(self.config.samples)]
+            value = filtered_distance(samples, self.config)
+            self.emit("distance_filtered", angle_deg=angle, distance_cm=value, samples_cm=samples, valid_count=sum(x is not None for x in samples), attempt=attempt + 1, reason="ok" if value is not None else "insufficient_valid_samples")
+            self.ir_blocked()
+            if value is not None:
+                return value
+            if attempt < self.config.measurement_retries:
+                self.emit("measurement_retry", angle_deg=angle, next_attempt=attempt + 2)
+        return None
 
     def scan(self, angles):
+        angles = tuple(angles)
+        if any(not self.config.servo_min_deg <= angle <= self.config.servo_max_deg for angle in angles):
+            self.emit("scan_rejected", angles_deg=angles, limits_deg=[self.config.servo_min_deg, self.config.servo_max_deg])
+            raise ValueError("Scan contains angles outside configured mechanical limits")
         self.brake("scan")
         self.emit("scan_start", angles_deg=list(angles))
         result = {}
@@ -256,6 +331,52 @@ class Hardware:
             finally:
                 self.gpio.cleanup(list(PINS.values()))
                 self.emit("gpio_cleanup")
+
+
+def parse_ir_pins(value):
+    try:
+        pins = tuple(int(item.strip()) for item in value.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError("IR pins must be comma-separated BCM integers")
+    reserved = set(PINS.values()) - {PINS["ir_left"], PINS["ir_right"]}
+    if not 1 <= len(pins) <= 8 or len(set(pins)) != len(pins) or any(pin < 2 or pin > 27 or pin in reserved for pin in pins):
+        raise argparse.ArgumentTypeError("Choose 1..8 distinct BCM inputs; motor, servo, ultrasonic, button and LED pins are reserved")
+    return pins
+
+
+class InfraredMonitor:
+    def __init__(self, pins, emit, stop):
+        self.pins = pins
+        self.emit = emit
+        self.stop = stop
+        self.gpio = None
+        self.initialized = []
+        self.previous = None
+        self.transitions = dict.fromkeys(pins, 0)
+
+    def initialize(self):
+        import RPi.GPIO as GPIO
+        self.gpio = GPIO
+        GPIO.setmode(GPIO.BCM)
+        for pin in self.pins:
+            GPIO.setup(pin, GPIO.IN)
+            self.initialized.append(pin)
+        self.emit("ir_monitor_start", numbering="BCM", pins=self.pins)
+
+    def poll(self):
+        levels = {pin: int(self.gpio.input(pin)) for pin in self.pins}
+        changed = [] if self.previous is None else [pin for pin in self.pins if levels[pin] != self.previous[pin]]
+        for pin in changed:
+            self.transitions[pin] += 1
+        self.emit("ir_snapshot", levels=levels, changed_pins=changed, transitions=self.transitions.copy())
+        self.previous = levels
+
+    def close(self):
+        if self.gpio is not None and self.initialized:
+            try:
+                self.emit("ir_monitor_summary", transitions=self.transitions.copy())
+            finally:
+                self.gpio.cleanup(self.initialized)
 
 
 class Video:
@@ -363,7 +484,7 @@ def load_config(path, auto=False):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Yahboom 4WD diagnostics and experimental navigation")
-    parser.add_argument("--mode", choices=("distance", "scan", "turn", "drive", "auto"), default="scan")
+    parser.add_argument("--mode", choices=("distance", "scan", "plan", "ir", "turn", "drive", "auto"), default="scan")
     parser.add_argument("--config", default=str(Path(__file__).with_name("robot_config.json")))
     parser.add_argument("--log-dir", default=str(Path(__file__).with_name("logs")))
     parser.add_argument("--cycles", type=int, default=1)
@@ -371,19 +492,24 @@ def main(argv=None):
     parser.add_argument("--drive-seconds", type=float, default=0.5)
     parser.add_argument("--max-seconds", type=float, default=30.0)
     parser.add_argument("--use-ir", action="store_true")
+    parser.add_argument("--ir-pins", type=parse_ir_pins, default="12,17")
     parser.add_argument("--video", action="store_true")
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args(argv)
     if args.cycles <= 0 or not 0 < args.max_seconds <= 600 or not 0 < abs(args.turn_deg) <= 90 or not 0 < args.drive_seconds <= 2:
         parser.error("Use positive cycles, duration 0..600s, turn 0..90 degrees, drive 0..2s")
+    if args.mode != "ir" and args.ir_pins != (12, 17):
+        parser.error("Custom --ir-pins are available only in stationary ir mode")
+    if args.mode == "ir" and (args.use_ir or args.video):
+        parser.error("IR monitor logs raw inputs; --use-ir and --video are not used in this mode")
     try:
-        config = load_config(args.config, args.mode == "auto")
+        config = load_config(args.config, args.mode in ("auto", "plan"))
     except (OSError, ValueError, TypeError) as exc:
         parser.error(str(exc))
     log = SessionLog(args.log_dir)
     stop = threading.Event()
     stop_reason = {"reason": None}
-    hardware = Hardware(config, log.emit, stop, args.use_ir)
+    hardware = InfraredMonitor(args.ir_pins, log.emit, stop) if args.mode == "ir" else Hardware(config, log.emit, stop, args.use_ir)
     video = Video(log, args.port) if args.video else None
     timer = None
     old_handlers = {}
@@ -406,21 +532,33 @@ def main(argv=None):
         timer.start()
         if video is not None:
             video.start()
-        if args.mode in ("distance", "scan"):
+        if args.mode == "ir":
+            while not stop.is_set():
+                hardware.poll()
+                stop.wait(0.1)
+        elif args.mode in ("distance", "scan", "plan"):
             for cycle in range(args.cycles):
                 log.emit("diagnostic_cycle", cycle=cycle + 1)
                 if args.mode == "distance":
                     hardware.measure(90)
                 else:
-                    hardware.scan((0, 45, 90, 135, 180))
+                    scan = hardware.scan(scan_angles(config))
+                    if args.mode == "plan":
+                        decision = navigation_plan(scan, config)
+                        if hardware.ir_blocked():
+                            decision = {"action": "stop", "reason": "ir_obstacle", "angle_deg": None}
+                        log.emit("navigation_plan", distances_cm=scan, **decision)
         elif args.mode == "turn":
             hardware.turn(args.turn_deg)
         elif args.mode == "drive":
             hardware.forward(args.drive_seconds)
         else:
             navigator = Navigator(config, hardware, log.emit)
-            while not stop.is_set() and navigator.tick():
-                pass
+            try:
+                while not stop.is_set() and navigator.tick():
+                    pass
+            finally:
+                hardware.brake("auto_finished")
         log.emit("session_complete", stop_requested=stop.is_set(), stop_reason=stop_reason["reason"])
     except (KeyboardInterrupt, InterruptedError) as exc:
         log.emit("interrupted", reason=str(exc), stop_requested=stop.is_set(), stop_reason=stop_reason["reason"])
