@@ -1,0 +1,11 @@
+{
+  "fps": 5,
+  "width": 320,
+  "roi": [0.15, 0.15, 0.85, 0.75],
+  "min_area_ratio": 0.04,
+  "min_saturation": 100,
+  "min_value": 60,
+  "confirm_frames": 3,
+  "red_hue_ranges": [[0, 10], [170, 179]],
+  "blue_hue_range": [95, 130]
+}

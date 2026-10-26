@@ -336,6 +336,8 @@ class Navigator:
             clear, details = route_clearance(scan, self.config)
             self.emit("escape_corridor", heading_estimate_deg=self.heading, scan_cm=scan, clear=clear, **details)
             if not clear:
+                if abs(self.heading) >= self.config.max_escape_angle_deg:
+                    return self.halt("escape_route_blocked")
                 self.phase = "escape"
                 return True
             self.phase = "bypass"

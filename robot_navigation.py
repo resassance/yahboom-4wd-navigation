@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from navigation import Config, Navigator, filtered_distance, navigation_plan, scan_angles
+from color_detection import ColorDetector, load_color_config
 
 
 PINS = {
@@ -380,7 +381,7 @@ class InfraredMonitor:
 
 
 class Video:
-    def __init__(self, log, port):
+    def __init__(self, log, port, color_config=None):
         self.log = log
         self.port = port
         self.stop = threading.Event()
@@ -390,6 +391,27 @@ class Video:
         self.thread = None
         self.server = None
         self.server_thread = None
+        self.error = None
+        self.ready = threading.Event()
+        self.color_config = color_config
+        self.detector = ColorDetector(color_config) if color_config is not None else None
+        self.color_result = None
+        self.color_processed = 0
+        self.next_color_at = float("-inf")
+        self.last_color_log = float("-inf")
+        self.last_logged_color = None
+
+    def update_color(self, frame, now):
+        if self.detector is None or now < self.next_color_at:
+            return
+        started = time.perf_counter()
+        self.color_result = self.detector.process(frame)
+        self.color_processed += 1
+        self.next_color_at = now + 1 / self.color_config.fps
+        if self.color_result["label"] != self.last_logged_color or now - self.last_color_log >= 5:
+            self.log.emit("color_result", **self.color_result, processed_frames=self.color_processed, processing_ms=round((time.perf_counter() - started) * 1000, 3))
+            self.last_logged_color = self.color_result["label"]
+            self.last_color_log = now
 
     def start(self):
         from flask import Flask, Response
@@ -398,7 +420,8 @@ class Video:
 
         @app.route("/")
         def index():
-            return "<h1>Yahboom 4WD</h1><p>Video is read-only. Stop from the terminal with Ctrl+C.</p><img src='/video_feed' width='640'>"
+            description = "Проверка цвета без команд моторам. RED — красный, BLUE — синий, UNKNOWN — цвет не определён. Рамка показывает область распознавания. Изображения не записываются." if self.detector is not None else "Видеонаблюдение. Остановка программы — Ctrl+C в терминале."
+            return "<!doctype html><html lang='ru'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Камера робота</title><h1>Камера робота</h1><p>" + description + "</p><img src='/video_feed' width='640' style='max-width:100%;height:auto' alt='Изображение с камеры робота'></html>"
 
         @app.route("/video_feed")
         def feed():
@@ -409,7 +432,12 @@ class Video:
         self.thread = threading.Thread(target=self.capture, daemon=True)
         self.server_thread.start()
         self.thread.start()
-        self.log.emit("video_server_start", port=self.port)
+        self.log.emit("video_server_start", port=self.server.server_port)
+        if not self.ready.wait(5):
+            self.stop.set()
+            raise RuntimeError("Camera did not publish a frame within 5 seconds")
+        if self.error is not None:
+            raise RuntimeError("Camera failed: " + str(self.error)) from self.error
 
     def capture(self):
         camera = None
@@ -418,14 +446,37 @@ class Video:
             camera = cv2.VideoCapture(0)
             if not camera.isOpened():
                 raise RuntimeError("Camera 0 could not be opened")
+            camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            camera.set(cv2.CAP_PROP_FPS, 15)
+            camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             self.log.emit("camera_open")
             last_stats = time.monotonic()
+            last_count = 0
             while not self.stop.is_set():
                 success, frame = camera.read()
                 if not success:
+                    if self.stop.is_set():
+                        break
                     raise RuntimeError("Camera read failed")
-                for index, text in enumerate((self.log.latest[:85], self.log.latest[85:170])):
-                    cv2.putText(frame, text, (10, 25 + index * 25), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+                if frame.shape[1] > 640:
+                    frame = cv2.resize(frame, (640, max(1, round(frame.shape[0] * 640 / frame.shape[1]))), interpolation=cv2.INTER_AREA)
+                now = time.monotonic()
+                self.update_color(frame, now)
+                if self.color_result is not None:
+                    result = self.color_result
+                    x, y, width, height = result["roi_box"]
+                    cv2.rectangle(frame, (x, y), (x + width, y + height), (160, 160, 160), 1)
+                    color = {"red": (0, 0, 255), "blue": (255, 0, 0), "unknown": (0, 255, 255)}[result["label"]]
+                    if result["box"] is not None:
+                        x, y, width, height = result["box"]
+                        cv2.rectangle(frame, (x, y), (x + width, y + height), color, 2)
+                    caption = result["label"].upper() + " / " + result["reason"]
+                    cv2.putText(frame, caption, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    cv2.putText(frame, "red %.1f%% blue %.1f%%" % (100 * result["red_ratio"], 100 * result["blue_ratio"]), (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                else:
+                    for index, text in enumerate((self.log.latest[:85], self.log.latest[85:170])):
+                        cv2.putText(frame, text, (10, 25 + index * 25), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
                 success, buffer = cv2.imencode(".jpg", frame)
                 if not success:
                     raise RuntimeError("JPEG encoding failed")
@@ -433,25 +484,35 @@ class Video:
                     self.frame = buffer.tobytes()
                     self.number += 1
                     self.condition.notify_all()
-                if time.monotonic() - last_stats >= 5:
-                    self.log.emit("camera_stats", total_frames=self.number)
-                    last_stats = time.monotonic()
-                self.stop.wait(0.03)
-        except Exception:
+                self.ready.set()
+                if now - last_stats >= 5:
+                    self.log.emit("camera_stats", total_frames=self.number, fps=round((self.number - last_count) / (now - last_stats), 2), color_processed=self.color_processed, frame_size=[frame.shape[1], frame.shape[0]])
+                    last_stats = now
+                    last_count = self.number
+                self.stop.wait(1 / 15)
+        except Exception as exc:
+            self.error = exc
             self.log.emit("camera_error", traceback=traceback.format_exc())
         finally:
-            if camera is not None:
-                camera.release()
-            self.stop.set()
-            with self.condition:
-                self.condition.notify_all()
-            self.log.emit("camera_closed", total_frames=self.number)
+            try:
+                if camera is not None:
+                    try:
+                        camera.release()
+                    except Exception as exc:
+                        self.error = self.error or exc
+                        self.log.emit("camera_error", traceback=traceback.format_exc())
+            finally:
+                self.stop.set()
+                self.ready.set()
+                with self.condition:
+                    self.condition.notify_all()
+                self.log.emit("camera_closed", total_frames=self.number)
 
     def frames(self):
         previous = -1
         while not self.stop.is_set():
             with self.condition:
-                self.condition.wait_for(lambda: self.number != previous or self.stop.is_set(), timeout=1)
+                self.condition.wait_for(lambda: self.frame is not None and self.number != previous or self.stop.is_set(), timeout=1)
                 if self.stop.is_set():
                     return
                 if self.frame is None or self.number == previous:
@@ -473,6 +534,8 @@ class Video:
         if self.thread is not None and self.thread.is_alive():
             raise RuntimeError("Camera thread did not finish shutdown")
         self.log.emit("video_shutdown")
+        if self.error is not None:
+            raise RuntimeError("Camera failed: " + str(self.error)) from self.error
 
 
 def load_config(path, auto=False):
@@ -484,7 +547,7 @@ def load_config(path, auto=False):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Yahboom 4WD diagnostics and experimental navigation")
-    parser.add_argument("--mode", choices=("distance", "scan", "plan", "ir", "turn", "drive", "auto"), default="scan")
+    parser.add_argument("--mode", choices=("distance", "scan", "plan", "ir", "turn", "drive", "auto", "color"), default="scan")
     parser.add_argument("--config", default=str(Path(__file__).with_name("robot_config.json")))
     parser.add_argument("--log-dir", default=str(Path(__file__).with_name("logs")))
     parser.add_argument("--cycles", type=int, default=1)
@@ -495,6 +558,7 @@ def main(argv=None):
     parser.add_argument("--ir-pins", type=parse_ir_pins, default="12,17")
     parser.add_argument("--video", action="store_true")
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--color-config", default=str(Path(__file__).with_name("color_config.json")))
     args = parser.parse_args(argv)
     if args.cycles <= 0 or not 0 < args.max_seconds <= 600 or not 0 < abs(args.turn_deg) <= 90 or not 0 < args.drive_seconds <= 2:
         parser.error("Use positive cycles, duration 0..600s, turn 0..90 degrees, drive 0..2s")
@@ -502,15 +566,18 @@ def main(argv=None):
         parser.error("Custom --ir-pins are available only in stationary ir mode")
     if args.mode == "ir" and (args.use_ir or args.video):
         parser.error("IR monitor logs raw inputs; --use-ir and --video are not used in this mode")
+    if args.mode == "color" and args.use_ir:
+        parser.error("Color mode does not initialize GPIO; --use-ir is unavailable")
     try:
-        config = load_config(args.config, args.mode in ("auto", "plan"))
+        config = Config() if args.mode == "color" else load_config(args.config, args.mode in ("auto", "plan"))
+        color_config = load_color_config(args.color_config) if args.mode == "color" else None
     except (OSError, ValueError, TypeError) as exc:
         parser.error(str(exc))
     log = SessionLog(args.log_dir)
     stop = threading.Event()
     stop_reason = {"reason": None}
-    hardware = InfraredMonitor(args.ir_pins, log.emit, stop) if args.mode == "ir" else Hardware(config, log.emit, stop, args.use_ir)
-    video = Video(log, args.port) if args.video else None
+    hardware = None if args.mode == "color" else InfraredMonitor(args.ir_pins, log.emit, stop) if args.mode == "ir" else Hardware(config, log.emit, stop, args.use_ir)
+    video = Video(log, args.port, color_config=color_config) if args.mode == "color" else Video(log, args.port) if args.video else None
     timer = None
     old_handlers = {}
     exit_code = 0
@@ -523,16 +590,24 @@ def main(argv=None):
     try:
         for sig in (signal.SIGINT, signal.SIGTERM):
             old_handlers[sig] = signal.signal(sig, lambda number, frame: request_stop(signal.Signals(number).name))
-        hashes = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in ("robot_navigation.py", "navigation.py")}
-        log.emit("session_start", mode=args.mode, arguments=vars(args), config=asdict(config), source_sha256=hashes, python=sys.version, log_directory=str(log.directory))
+        hashes = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in ("robot_navigation.py", "navigation.py", "color_detection.py")}
+        log.emit("session_start", mode=args.mode, arguments=vars(args), config=asdict(config), color_config=asdict(color_config) if color_config is not None else None, source_sha256=hashes, python=sys.version, log_directory=str(log.directory))
         (log.directory / "config.json").write_text(json.dumps(asdict(config), indent=2) + "\n", encoding="utf-8")
-        hardware.initialize()
+        if color_config is not None:
+            (log.directory / "color_config.json").write_text(json.dumps(asdict(color_config), indent=2) + "\n", encoding="utf-8")
+        if hardware is not None:
+            hardware.initialize()
         timer = threading.Timer(args.max_seconds, request_stop, args=("time_limit",))
         timer.daemon = True
         timer.start()
         if video is not None:
             video.start()
-        if args.mode == "ir":
+        if args.mode == "color":
+            while not stop.is_set():
+                if video.stop.is_set():
+                    raise RuntimeError("Camera stopped: " + str(video.error or "unexpected shutdown"))
+                stop.wait(0.1)
+        elif args.mode == "ir":
             while not stop.is_set():
                 hardware.poll()
                 stop.wait(0.1)
