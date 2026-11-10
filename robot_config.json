@@ -1,5 +1,5 @@
 {
-  "safe_distance_cm": 20.0,
+  "safe_distance_cm": 10.0,
   "resume_distance_cm": 30.0,
   "clearance_margin_cm": 5.0,
   "robot_width_cm": 18.5,
@@ -14,10 +14,6 @@
   "max_escape_angle_deg": 90.0,
   "turn_right_deg_per_sec": 60.0,
   "turn_left_deg_per_sec": 60.0,
-  "min_bypass_steps": 4,
-  "return_probe_steps": 8,
-  "clear_checks_to_resume": 2,
-  "max_bypass_steps": 30,
   "samples": 5,
   "min_valid_samples": 3,
   "measurement_retries": 1,
@@ -29,5 +25,24 @@
   "servo_step_deg": 3,
   "servo_step_seconds": 0.02,
   "servo_settle_seconds": 0.3,
-  "ir_active_level": 0
+  "ir_active_level": 0,
+  "bypass_segment_seconds": 1.5,
+  "retry_pause_seconds": 1.0,
+  "min_return_progress_seconds": 0.3,
+  "bypass_observation_seconds": 0.4,
+  "ir_classification_pins": [
+    12,
+    17
+  ],
+  "ir_obstacle_patterns": {},
+  "ir_background_pattern": null,
+  "ir_min_distance_cm": null,
+  "ir_max_distance_cm": null,
+  "ir_confirm_samples": 3,
+  "push_speed": 10.0,
+  "push_seconds": 0.3,
+  "return_probe_seconds": 1.5,
+  "return_tolerance_seconds": 0.03,
+  "drive_speed_cm_s": null,
+  "range_reference_heading_deg": null
 }

@@ -9,4 +9,3 @@ robot_config.local.json
 .env
 .env.*
 
-/tests/
