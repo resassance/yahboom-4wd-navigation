@@ -39,7 +39,7 @@ class InfraredTests(unittest.TestCase):
                 calibrated(**changes).validate()
 
     def test_new_stopping_threshold_preserves_geometry(self):
-        self.assertEqual(Config().safe_distance_cm, 10)
+        self.assertEqual(Config().safe_distance_cm, 14)
         self.assertEqual(replace(Config(), sensor_forward_offset_cm=0).forward_threshold(), 17)
 
     def test_malformed_numeric_parameters_rejected_cleanly(self):

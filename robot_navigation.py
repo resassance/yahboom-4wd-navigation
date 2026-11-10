@@ -58,11 +58,15 @@ class SessionLog:
 
 
 class Hardware:
-    def __init__(self, config, emit, stop, use_ir=False):
+    def __init__(self, config, emit, stop, use_ir=False, ir_turn_guard=False):
         self.config = config
         self.emit = emit
         self.stop = stop
         self.use_ir = use_ir
+        self.ir_turn_guard = ir_turn_guard
+        self.maneuver_mode = False
+        self.monitored_distance = None
+        self.applied_forward_pwm = None
         self.gpio = None
         self.left = None
         self.right = None
@@ -94,7 +98,7 @@ class Hardware:
         self.right.start(0)
         self.servo = GPIO.PWM(PINS["servo"], 50)
         self.servo.start(0)
-        self.emit("gpio_initialized", numbering="BCM", pins=PINS, ir_protection_enabled=self.use_ir)
+        self.emit("gpio_initialized", numbering="BCM", pins=PINS, ir_protection_enabled=self.use_ir, ir_turn_guard_enabled=self.ir_turn_guard)
         self.point(90)
         self.ir_blocked()
 
@@ -111,6 +115,41 @@ class Hardware:
         blocked = self.use_ir and self.config.ir_active_level in (left, right)
         self.emit("ir_reading", left_raw=left, right_raw=right, active_level=self.config.ir_active_level, protection_enabled=self.use_ir, blocked=blocked)
         return blocked
+
+    def turn_ir_state(self):
+        levels = tuple(int(self.gpio.input(PINS[name])) for name in ("ir_left", "ir_right"))
+        active = tuple(level == self.config.ir_active_level for level in levels)
+        self.emit("turn_ir_reading", pins_bcm=[PINS["ir_left"], PINS["ir_right"]], levels=levels, left_active=active[0], right_active=active[1])
+        return active
+
+    def available_turn_sides(self):
+        if not self.ir_turn_guard:
+            return {"left", "right"}
+        state = self.turn_ir_state()
+        return {side for side, active in zip(("left", "right"), state) if not active}
+
+    def set_maneuver_mode(self, enabled):
+        if enabled == self.maneuver_mode:
+            return
+        if self.moving:
+            raise RuntimeError("Stop before changing maneuver speed profile")
+        self.maneuver_mode = enabled
+        self.emit("drive_profile", maneuver=enabled, maneuver_pwm=self.config.slow_speed)
+
+    def forward_pwm(self):
+        slow = self.maneuver_mode or self.monitored_distance is None or self.monitored_distance <= self.config.slow_distance_cm
+        speed = self.config.slow_speed if slow else self.config.move_speed
+        return speed + self.config.left_drive_trim_pwm, speed + self.config.right_drive_trim_pwm
+
+    def apply_forward_pwm(self):
+        pwm = self.forward_pwm()
+        if any(not 0 < value <= 100 for value in pwm):
+            raise ValueError("Invalid forward PWM")
+        if pwm != self.applied_forward_pwm:
+            self.left.ChangeDutyCycle(pwm[0])
+            self.right.ChangeDutyCycle(pwm[1])
+            self.applied_forward_pwm = pwm
+            self.emit("forward_speed", pwm_left=pwm[0], pwm_right=pwm[1], distance_cm=self.monitored_distance, maneuver=self.maneuver_mode)
 
     def read_classification_ir(self):
         levels = [int(self.gpio.input(pin)) for pin in self.config.ir_classification_pins]
@@ -226,6 +265,7 @@ class Hardware:
             except Exception as exc:
                 errors.append(str(exc))
         self.moving = False
+        self.applied_forward_pwm = None
         started = self.cruising_since
         self.cruising_since = None
         elapsed = 0.0 if started is None else time.monotonic() - started
@@ -250,6 +290,11 @@ class Hardware:
             raise RuntimeError("Sensor must be centred before moving")
         if self.ir_blocked():
             raise ObstacleDetected("IR obstacle before movement")
+        turn_ir_initial = self.turn_ir_state() if kind == "turn" and self.ir_turn_guard else None
+        if turn_ir_initial is not None and turn_ir_initial[1 if angle > 0 else 0]:
+            self.emit("turn_ir_stop", phase="before_turn", angle_deg=angle, reason="target_side_detected")
+            raise ObstacleDetected("IR obstacle on target side before turn")
+        turn_ir_previous = turn_ir_initial
         self.emit("motor_start", kind=kind, duration_requested_seconds=seconds, pwm_left=speed, pwm_right=right_speed, angle_requested_deg=angle)
         started = time.monotonic()
         try:
@@ -263,14 +308,21 @@ class Hardware:
                 self.wait(min(0.02, deadline - time.monotonic()))
                 if self.use_ir and self.ir_blocked():
                     raise ObstacleDetected("IR obstacle during movement", heading_uncertain=kind == "turn")
+                if turn_ir_initial is not None:
+                    active = self.turn_ir_state()
+                    if active[1 if angle > 0 else 0] or any(now and not previous for now, previous in zip(active, turn_ir_previous)):
+                        self.emit("turn_ir_stop", phase="during_turn", angle_deg=angle, reason="target_side_or_new_detection")
+                        raise ObstacleDetected("IR obstacle during turn", heading_uncertain=True)
+                    turn_ir_previous = active
         finally:
             elapsed = time.monotonic() - started
             self.brake("pulse_finished")
             self.emit("motor_stop", kind=kind, duration_actual_seconds=round(elapsed, 6), angle_requested_deg=angle)
         self.wait(0.1)
 
-    def forward(self, seconds):
-        self.pulse("forward", seconds, self.config.move_speed + self.config.left_drive_trim_pwm, (1, 0, 1, 0), right_speed=self.config.move_speed + self.config.right_drive_trim_pwm)
+    def forward(self, seconds, slow=False):
+        speed = self.config.slow_speed if slow else self.config.move_speed
+        self.pulse("forward", seconds, speed + self.config.left_drive_trim_pwm, (1, 0, 1, 0), right_speed=speed + self.config.right_drive_trim_pwm)
 
     def advance(self, seconds):
         try:
@@ -285,16 +337,14 @@ class Hardware:
             if self.cruising_since is None:
                 if self.moving:
                     raise RuntimeError("Another motor command is active")
-                left = self.config.move_speed + self.config.left_drive_trim_pwm
-                right = self.config.move_speed + self.config.right_drive_trim_pwm
+                left, right = self.forward_pwm()
                 if not 0 < left <= 100 or not 0 < right <= 100:
                     raise ValueError("Invalid forward PWM")
                 self.emit("motor_start", kind="forward", continuous=True, pwm_left=left, pwm_right=right, monitoring_interval_seconds=seconds)
                 self.moving = True
                 for name, value in zip(("IN1", "IN2", "IN3", "IN4"), (1, 0, 1, 0)):
                     self.gpio.output(PINS[name], value)
-                self.left.ChangeDutyCycle(left)
-                self.right.ChangeDutyCycle(right)
+                self.apply_forward_pwm()
                 self.cruising_since = time.monotonic()
             deadline = time.monotonic() + seconds
             while time.monotonic() < deadline:
@@ -310,6 +360,7 @@ class Hardware:
         if not self.moving:
             value = self.measure(90)
             self.read_classification_ir()
+            self.monitored_distance = value
             return value
         try:
             if self.stop.is_set():
@@ -319,8 +370,11 @@ class Hardware:
             self.measurement_attempt = 1
             value = self.raw_distance(1)
             self.read_classification_ir()
+            self.monitored_distance = value
             if value is None or value <= self.config.forward_threshold():
                 self.brake("invalid_front_measurement" if value is None else "front_obstacle")
+            else:
+                self.apply_forward_pwm()
             self.emit("front_monitor", distance_cm=value, threshold_cm=self.config.forward_threshold(), motors_active=self.moving, reason="invalid_measurement" if value is None else "obstacle" if value <= self.config.forward_threshold() else "clear")
             return value
         except BaseException:
@@ -724,6 +778,8 @@ def main(argv=None):
     parser.add_argument("--drive-seconds", type=float, default=0.5)
     parser.add_argument("--max-seconds", type=float, default=30.0)
     parser.add_argument("--obstacle-mode", choices=("bypass", "ir"), default="bypass")
+    parser.add_argument("--ir-turn-guard", action="store_true")
+    parser.add_argument("--slow", action="store_true")
     parser.add_argument("--use-ir", action="store_true")
     parser.add_argument("--ir-pins", type=parse_ir_pins, default="12,17")
     parser.add_argument("--video", action="store_true")
@@ -732,6 +788,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.cycles <= 0 or not 0 < args.max_seconds <= 600 or not 0 < abs(args.turn_deg) <= 90 or not 0 < args.drive_seconds <= 2:
         parser.error("Use positive cycles, duration 0..600s, turn 0..90 degrees, drive 0..2s")
+    if args.ir_turn_guard and args.mode not in ("auto", "turn"):
+        parser.error("--ir-turn-guard is available only in auto and turn modes")
+    if args.slow and args.mode != "drive":
+        parser.error("--slow is available only in drive mode")
     if args.mode != "ir" and args.ir_pins != (12, 17):
         parser.error("Custom --ir-pins are available only in stationary ir mode")
     if args.mode == "ir" and (args.use_ir or args.video):
@@ -749,7 +809,7 @@ def main(argv=None):
         parser.error(f"Cannot create logs in {args.log_dir}: {exc}. Use --log-dir with a writable folder.")
     stop = threading.Event()
     stop_reason = {"reason": None}
-    hardware = None if args.mode == "color" else InfraredMonitor(args.ir_pins, log.emit, stop) if args.mode == "ir" else Hardware(config, log.emit, stop, args.use_ir)
+    hardware = None if args.mode == "color" else InfraredMonitor(args.ir_pins, log.emit, stop) if args.mode == "ir" else Hardware(config, log.emit, stop, args.use_ir, ir_turn_guard=args.ir_turn_guard)
     video = Video(log, args.port, color_config=color_config, session_stop=stop) if args.mode == "color" else Video(log, args.port, session_stop=stop) if args.video else None
     timer = None
     old_handlers = {}
@@ -799,9 +859,9 @@ def main(argv=None):
         elif args.mode == "turn":
             hardware.turn(args.turn_deg)
         elif args.mode == "drive":
-            hardware.forward(args.drive_seconds)
+            hardware.forward(args.drive_seconds, slow=args.slow)
         else:
-            navigator = Navigator(config, hardware, log.emit, obstacle_mode=args.obstacle_mode)
+            navigator = Navigator(config, hardware, log.emit, obstacle_mode=args.obstacle_mode, ir_turn_guard=args.ir_turn_guard)
             try:
                 while not stop.is_set():
                     try:

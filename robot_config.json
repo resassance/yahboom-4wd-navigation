@@ -1,5 +1,5 @@
 {
-  "safe_distance_cm": 10.0,
+  "safe_distance_cm": 14,
   "resume_distance_cm": 30.0,
   "clearance_margin_cm": 5.0,
   "robot_width_cm": 18.5,
@@ -44,5 +44,8 @@
   "return_probe_seconds": 1.5,
   "return_tolerance_seconds": 0.03,
   "drive_speed_cm_s": null,
-  "range_reference_heading_deg": null
+  "range_reference_heading_deg": null,
+  "slow_speed": 15,
+  "slow_distance_cm": 35,
+  "approach_step_seconds": 0.02
 }

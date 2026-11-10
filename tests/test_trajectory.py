@@ -175,3 +175,13 @@ class ReturnTests(unittest.TestCase):
         n.tick()
         h.advance.assert_not_called()
         self.assertEqual(n.phase, "trajectory_wait")
+
+    def test_stopped_return_measurements_keep_existing_motor_pulse_length(self):
+        n, h = self.navigator()
+        n.heading = -90
+        n.phase = "trajectory_cross"
+        n.trajectory.observed_runtime = h.runtime
+        h.front_distance.return_value = 20
+        n.tick()
+        h.advance.assert_called_once_with(n.config.step_seconds)
+        h.brake.assert_called_with("trajectory_cross_step")

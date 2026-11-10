@@ -17,6 +17,9 @@ class World:
     def forward_runtime_seconds(self):
         return self.runtime
 
+    def set_maneuver_mode(self, enabled):
+        pass
+
     def ir_blocked(self):
         return False
 

@@ -13,13 +13,16 @@ class ObstacleDetected(InterruptedError):
 
 @dataclass
 class Config:
-    safe_distance_cm: float = 10.0
+    safe_distance_cm: float = 14.0
     resume_distance_cm: float = 30.0
     clearance_margin_cm: float = 5.0
     robot_width_cm: float = 18.5
     robot_length_cm: float = 24.0
     sensor_forward_offset_cm: float = None
     move_speed: float = 25.0
+    slow_speed: float = 15.0
+    slow_distance_cm: float = 35.0
+    approach_step_seconds: float = 0.02
     left_drive_trim_pwm: float = 0.0
     right_drive_trim_pwm: float = 0.0
     turn_speed: float = 10.0
@@ -112,8 +115,12 @@ class Config:
             raise ValueError("Push must last at most 0.3 seconds at PWM no higher than 10 or move_speed")
         if not 0 < self.move_speed <= 100 or not 0 < self.turn_speed <= 100:
             raise ValueError("PWM speed must be between 0 and 100")
+        if not 0 < self.slow_speed <= self.move_speed or not self.forward_threshold() < self.slow_distance_cm < self.max_distance_cm:
+            raise ValueError("Slow speed must not exceed move_speed; slowdown must start before the stopping threshold")
+        if not 0 < self.approach_step_seconds <= min(0.05, self.step_seconds):
+            raise ValueError("Approach monitoring interval must be no more than 0.05 seconds and step_seconds")
         for trim in (self.left_drive_trim_pwm, self.right_drive_trim_pwm):
-            if abs(trim) > 10 or not 0 < self.move_speed + trim <= 100:
+            if abs(trim) > 10 or any(not 0 < speed + trim <= 100 for speed in (self.move_speed, self.slow_speed)):
                 raise ValueError("Drive trim must be within -10..10 and leave PWM within 0..100")
         if not 0 <= self.measurement_retries <= 2:
             raise ValueError("Measurement retries must be between 0 and 2")
@@ -152,6 +159,9 @@ class Config:
     def forward_threshold(self):
         nose = 0.0 if self.robot_length_cm is None or self.sensor_forward_offset_cm is None else self.robot_length_cm / 2 - self.sensor_forward_offset_cm
         return max(self.safe_distance_cm, nose + self.clearance_margin_cm)
+
+    def forward_interval(self, distance):
+        return self.approach_step_seconds if distance is None or distance <= self.slow_distance_cm else self.step_seconds
 
     def rotation_threshold(self, angle):
         radius = max(math.hypot(self.robot_width_cm, self.robot_length_cm) / 2, abs(self.sensor_forward_offset_cm)) + self.clearance_margin_cm
@@ -258,7 +268,7 @@ def navigation_plan(scan, config):
 
 
 class Navigator:
-    def __init__(self, config, hardware, emit, obstacle_mode="ir"):
+    def __init__(self, config, hardware, emit, obstacle_mode="ir", ir_turn_guard=False):
         self.config = config
         self.hardware = hardware
         self.emit = emit
@@ -284,6 +294,7 @@ class Navigator:
         self.waiting_heading = None
         self.waiting_runtime = None
         self.push_attempted = False
+        self.ir_turn_guard = ir_turn_guard
         self.obstacle_mode = obstacle_mode
         self.path = PathMemory(config, emit)
         self.trajectory = TrajectoryReturn(self)
@@ -412,6 +423,7 @@ class Navigator:
             return self.trajectory.start()
         if self.bypass_drive_seconds >= self.config.min_return_progress_seconds:
             self.push_attempted = False
+        self.hardware.set_maneuver_mode(False)
         self.phase = "cruise"
         self.segment_started_runtime = None
         self.transition("forward", reason="original_course_corridor_confirmed")
@@ -439,9 +451,14 @@ class Navigator:
                 return self.resume_course()
             if not clear:
                 self.block_route(0, details["reason"])
-            if self.bypass_heading in (-90, 90) and self.bypass_heading not in self.blocked_routes:
+            allowed_sides = self.hardware.available_turn_sides() if self.ir_turn_guard else {"left", "right"}
+            if self.ir_turn_guard:
+                self.emit("turn_ir_choice", allowed_sides=sorted(allowed_sides))
+            previous_side = "right" if self.bypass_heading > 0 else "left"
+            if self.bypass_heading in (-90, 90) and self.bypass_heading not in self.blocked_routes and previous_side in allowed_sides:
                 return self.select_side(self.bypass_heading, scan)
             excluded = ["right" if heading > 0 else "left" for heading in self.blocked_routes if heading != 0]
+            excluded += sorted({"left", "right"} - allowed_sides)
             angle, details = choose_turn(scan, self.config, excluded)
             self.emit("turn_decision", angle_deg=angle, scan_cm=scan, **details)
             if angle is None:
@@ -554,7 +571,7 @@ class Navigator:
         observed = self.corridor_observed_runtime if self.corridor_observed_runtime is not None else self.hardware.forward_runtime_seconds()
         until_observation = self.config.bypass_observation_seconds - (self.hardware.forward_runtime_seconds() - observed)
         self.transition("bypassing")
-        self.hardware.advance(min(self.config.step_seconds, remaining, max(1e-6, until_observation)))
+        self.hardware.advance(min(self.config.forward_interval(front), remaining, max(1e-6, until_observation)))
         self.bypass_steps += 1
         self.update_progress()
         self.emit("bypass_progress", steps=self.bypass_steps, **self.motion_details())
@@ -616,7 +633,7 @@ class Navigator:
                 return self.wait_for_path("invalid_front_measurement")
             if front > self.config.forward_threshold():
                 self.transition("forward")
-                self.hardware.advance(self.config.step_seconds)
+                self.hardware.advance(self.config.forward_interval(front))
                 return True
             self.hardware.brake("front_obstacle")
             self.update_progress()
@@ -643,6 +660,7 @@ class Navigator:
                     self.phase = "cruise"
                     self.transition("forward", reason="corridor_clear_after_push")
                     return True
+            self.hardware.set_maneuver_mode(True)
             self.path.begin(self.hardware.forward_runtime_seconds())
             self.block_route(0, "front_obstacle")
             self.phase = "replan"

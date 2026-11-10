@@ -174,7 +174,7 @@ class TrajectoryReturn:
             n.update_progress()
             if front is None or front <= n.config.forward_threshold():
                 return self.wait("trajectory_align", "invalid_front_measurement" if front is None else "trajectory_front_obstacle")
-            n.hardware.advance(min(n.config.step_seconds, max(0.001, n.config.return_probe_seconds - (n.hardware.forward_runtime_seconds() - self.follow_started))))
+            n.hardware.advance(min(n.config.forward_interval(front), max(0.001, n.config.return_probe_seconds - (n.hardware.forward_runtime_seconds() - self.follow_started))))
             return True
         if n.phase == "trajectory_cross":
             remaining = abs(n.path.lateral_seconds)
