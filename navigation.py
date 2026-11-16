@@ -30,7 +30,7 @@ class Config:
     turn_angle_deg: float = 45.0
     max_escape_angle_deg: float = 90.0
     turn_right_deg_per_sec: float = 60.0
-    turn_left_deg_per_sec: float = 60.0
+    turn_left_deg_per_sec: float = 63.0
     min_bypass_steps: int = 4
     return_probe_steps: int = 8
     clear_checks_to_resume: int = 2
@@ -239,7 +239,7 @@ def route_clearance(scan, config, distance=None):
     return clear, {"reason": "corridor_clear" if clear else "robot_width_corridor_blocked", "distance_required_cm": distance, "half_width_with_margin_cm": half_width, "blocking_rays": blocked}
 
 
-def choose_turn(scan, config, excluded_sides=()):
+def choose_turn(scan, config, excluded_sides=(), preferred_sides=()):
     clear, rotation = rotation_clearance(scan, config)
     if not clear:
         return None, {"reason": "rotation_clearance_or_measurement", "rotation": rotation}
@@ -251,8 +251,9 @@ def choose_turn(scan, config, excluded_sides=()):
     allowed = {side: score for side, score in scores.items() if score > threshold and side not in excluded_sides}
     if not allowed:
         return None, {"reason": "both_escape_directions_blocked", "scores_cm": scores, "threshold_cm": threshold}
-    best = max(allowed.values())
-    side = "right" if "right" in allowed and allowed["right"] >= best - config.clearance_margin_cm else max(allowed, key=allowed.get)
+    candidates = {side: score for side, score in allowed.items() if side in preferred_sides} or allowed
+    best = max(candidates.values())
+    side = "right" if "right" in candidates and candidates["right"] >= best - config.clearance_margin_cm else max(candidates, key=candidates.get)
     turn = angle if side == "right" else -angle
     return turn, {"reason": "escape_probe_then_rescan", "side": side, "scores_cm": scores, "threshold_cm": threshold, "actual_turn_deg": angle, "translation_authorized": False}
 
@@ -268,7 +269,7 @@ def navigation_plan(scan, config):
 
 
 class Navigator:
-    def __init__(self, config, hardware, emit, obstacle_mode="ir", ir_turn_guard=False):
+    def __init__(self, config, hardware, emit, obstacle_mode="ir", ir_turn_guard=False, ir_assist=False):
         self.config = config
         self.hardware = hardware
         self.emit = emit
@@ -295,6 +296,7 @@ class Navigator:
         self.waiting_runtime = None
         self.push_attempted = False
         self.ir_turn_guard = ir_turn_guard
+        self.ir_assist = ir_assist
         self.obstacle_mode = obstacle_mode
         self.path = PathMemory(config, emit)
         self.trajectory = TrajectoryReturn(self)
@@ -451,15 +453,17 @@ class Navigator:
                 return self.resume_course()
             if not clear:
                 self.block_route(0, details["reason"])
-            allowed_sides = self.hardware.available_turn_sides() if self.ir_turn_guard else {"left", "right"}
-            if self.ir_turn_guard:
-                self.emit("turn_ir_choice", allowed_sides=sorted(allowed_sides))
+            free_sides = self.hardware.available_turn_sides() if self.ir_turn_guard or self.ir_assist else {"left", "right"}
+            allowed_sides = free_sides if self.ir_turn_guard else {"left", "right"}
+            preferred_sides = free_sides if self.ir_assist else ()
+            if self.ir_turn_guard or self.ir_assist:
+                self.emit("turn_ir_choice", mode="advisory" if self.ir_assist else "guard", allowed_sides=sorted(allowed_sides), preferred_sides=sorted(preferred_sides))
             previous_side = "right" if self.bypass_heading > 0 else "left"
             if self.bypass_heading in (-90, 90) and self.bypass_heading not in self.blocked_routes and previous_side in allowed_sides:
                 return self.select_side(self.bypass_heading, scan)
             excluded = ["right" if heading > 0 else "left" for heading in self.blocked_routes if heading != 0]
             excluded += sorted({"left", "right"} - allowed_sides)
-            angle, details = choose_turn(scan, self.config, excluded)
+            angle, details = choose_turn(scan, self.config, excluded, preferred_sides=preferred_sides)
             self.emit("turn_decision", angle_deg=angle, scan_cm=scan, **details)
             if angle is None:
                 for side, score in details.get("scores_cm", {}).items():

@@ -58,12 +58,13 @@ class SessionLog:
 
 
 class Hardware:
-    def __init__(self, config, emit, stop, use_ir=False, ir_turn_guard=False):
+    def __init__(self, config, emit, stop, use_ir=False, ir_turn_guard=False, ir_assist=False):
         self.config = config
         self.emit = emit
         self.stop = stop
         self.use_ir = use_ir
         self.ir_turn_guard = ir_turn_guard
+        self.ir_assist = ir_assist
         self.maneuver_mode = False
         self.monitored_distance = None
         self.applied_forward_pwm = None
@@ -98,7 +99,7 @@ class Hardware:
         self.right.start(0)
         self.servo = GPIO.PWM(PINS["servo"], 50)
         self.servo.start(0)
-        self.emit("gpio_initialized", numbering="BCM", pins=PINS, ir_protection_enabled=self.use_ir, ir_turn_guard_enabled=self.ir_turn_guard)
+        self.emit("gpio_initialized", numbering="BCM", pins=PINS, ir_protection_enabled=self.use_ir, ir_turn_guard_enabled=self.ir_turn_guard, ir_assist_enabled=self.ir_assist)
         self.point(90)
         self.ir_blocked()
 
@@ -123,7 +124,7 @@ class Hardware:
         return active
 
     def available_turn_sides(self):
-        if not self.ir_turn_guard:
+        if not self.ir_turn_guard and not self.ir_assist:
             return {"left", "right"}
         state = self.turn_ir_state()
         return {side for side, active in zip(("left", "right"), state) if not active}
@@ -290,8 +291,8 @@ class Hardware:
             raise RuntimeError("Sensor must be centred before moving")
         if self.ir_blocked():
             raise ObstacleDetected("IR obstacle before movement")
-        turn_ir_initial = self.turn_ir_state() if kind == "turn" and self.ir_turn_guard else None
-        if turn_ir_initial is not None and turn_ir_initial[1 if angle > 0 else 0]:
+        turn_ir_initial = self.turn_ir_state() if kind == "turn" and (self.ir_turn_guard or self.ir_assist) else None
+        if self.ir_turn_guard and turn_ir_initial is not None and turn_ir_initial[1 if angle > 0 else 0]:
             self.emit("turn_ir_stop", phase="before_turn", angle_deg=angle, reason="target_side_detected")
             raise ObstacleDetected("IR obstacle on target side before turn")
         turn_ir_previous = turn_ir_initial
@@ -310,7 +311,7 @@ class Hardware:
                     raise ObstacleDetected("IR obstacle during movement", heading_uncertain=kind == "turn")
                 if turn_ir_initial is not None:
                     active = self.turn_ir_state()
-                    if active[1 if angle > 0 else 0] or any(now and not previous for now, previous in zip(active, turn_ir_previous)):
+                    if self.ir_turn_guard and (active[1 if angle > 0 else 0] or any(now and not previous for now, previous in zip(active, turn_ir_previous))):
                         self.emit("turn_ir_stop", phase="during_turn", angle_deg=angle, reason="target_side_or_new_detection")
                         raise ObstacleDetected("IR obstacle during turn", heading_uncertain=True)
                     turn_ir_previous = active
@@ -778,6 +779,7 @@ def main(argv=None):
     parser.add_argument("--drive-seconds", type=float, default=0.5)
     parser.add_argument("--max-seconds", type=float, default=30.0)
     parser.add_argument("--obstacle-mode", choices=("bypass", "ir"), default="bypass")
+    parser.add_argument("--ir-assist", action="store_true")
     parser.add_argument("--ir-turn-guard", action="store_true")
     parser.add_argument("--slow", action="store_true")
     parser.add_argument("--use-ir", action="store_true")
@@ -788,8 +790,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.cycles <= 0 or not 0 < args.max_seconds <= 600 or not 0 < abs(args.turn_deg) <= 90 or not 0 < args.drive_seconds <= 2:
         parser.error("Use positive cycles, duration 0..600s, turn 0..90 degrees, drive 0..2s")
-    if args.ir_turn_guard and args.mode not in ("auto", "turn"):
-        parser.error("--ir-turn-guard is available only in auto and turn modes")
+    if (args.ir_turn_guard or args.ir_assist) and args.mode not in ("auto", "turn"):
+        parser.error("IR turn options are available only in auto and turn modes")
+    if args.ir_assist and (args.ir_turn_guard or args.use_ir):
+        parser.error("--ir-assist cannot be combined with --ir-turn-guard or --use-ir")
     if args.slow and args.mode != "drive":
         parser.error("--slow is available only in drive mode")
     if args.mode != "ir" and args.ir_pins != (12, 17):
@@ -809,7 +813,7 @@ def main(argv=None):
         parser.error(f"Cannot create logs in {args.log_dir}: {exc}. Use --log-dir with a writable folder.")
     stop = threading.Event()
     stop_reason = {"reason": None}
-    hardware = None if args.mode == "color" else InfraredMonitor(args.ir_pins, log.emit, stop) if args.mode == "ir" else Hardware(config, log.emit, stop, args.use_ir, ir_turn_guard=args.ir_turn_guard)
+    hardware = None if args.mode == "color" else InfraredMonitor(args.ir_pins, log.emit, stop) if args.mode == "ir" else Hardware(config, log.emit, stop, args.use_ir, ir_turn_guard=args.ir_turn_guard, ir_assist=args.ir_assist)
     video = Video(log, args.port, color_config=color_config, session_stop=stop) if args.mode == "color" else Video(log, args.port, session_stop=stop) if args.video else None
     timer = None
     old_handlers = {}
@@ -861,7 +865,7 @@ def main(argv=None):
         elif args.mode == "drive":
             hardware.forward(args.drive_seconds, slow=args.slow)
         else:
-            navigator = Navigator(config, hardware, log.emit, obstacle_mode=args.obstacle_mode, ir_turn_guard=args.ir_turn_guard)
+            navigator = Navigator(config, hardware, log.emit, obstacle_mode=args.obstacle_mode, ir_turn_guard=args.ir_turn_guard, ir_assist=args.ir_assist)
             try:
                 while not stop.is_set():
                     try:

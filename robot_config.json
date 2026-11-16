@@ -13,7 +13,7 @@
   "turn_angle_deg": 45.0,
   "max_escape_angle_deg": 90.0,
   "turn_right_deg_per_sec": 60.0,
-  "turn_left_deg_per_sec": 60.0,
+  "turn_left_deg_per_sec": 63,
   "samples": 5,
   "min_valid_samples": 3,
   "measurement_retries": 1,
